@@ -1,0 +1,78 @@
+# Dataset directories
+data/
+datasets/
+dataset/
+*/data/
+*/datasets/
+*/dataset/
+downloaded_images_5000/
+
+# Model checkpoints and weights
+models/checkpoints/
+checkpoints/
+weights/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.pickle
+model_*.pth
+checkpoint_*.pth
+best_model.pth
+last_checkpoint.pth
+
+# Logs and training outputs
+logs/
+HAST_log/
+outputs/
+results/
+experiments/
+runs/
+*.log
+*.out
+train_test.log
+
+
+# Cache directories
+__pycache__/
+*.py[cod]
+*$py.class
+.cache/
+*.so
+
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Large files
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# Training artifacts
+save/
+saved_models/
+tensorboard_logs/
+wandb/
+
+# Output evaluation results
+output_eval/
+
+# Specific to this project
+data/imagenet/
+data/cifar10/
+data/cifar100/
+data/dermamnist/
+data/tissuemnist/
+models/output_eval/

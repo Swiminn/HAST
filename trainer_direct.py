@@ -13,11 +13,18 @@ import utils as utils
 import numpy as np
 import torch
 from pytorchcv.models.resnet import ResUnit
-from pytorchcv.models.mobilenet import DwsConvBlock
-from pytorchcv.models.mobilenetv2 import LinearBottleneck
+# from pytorchcv.models.mobilenet import DwsConvBlock
+# from pytorchcv.models.mobilenetv2 import LinearBottleneck
+from models.models import Bottleneck, BasicBlock
 from quantization_utils.quant_modules import *
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
+try:
+	import medmnist
+	from medmnist import INFO, Evaluator
+	MEDMNIST_AVAILABLE = True
+except ImportError:
+	MEDMNIST_AVAILABLE = False
 
 
 __all__ = ["Trainer"]
@@ -28,7 +35,7 @@ class Trainer(object):
 	trainer for training network, use SGD
 	"""
 	
-	def __init__(self, model, model_teacher, generator, lr_master_S, lr_master_G,
+	def __init__(self, model, model_teacher, lr_master_S, lr_master_G,
 	             train_loader, test_loader, settings, args, logger, tensorboard_logger=None,
 	             opt_type="SGD", optimizer_state=None, run_count=0):
 		"""
@@ -39,7 +46,6 @@ class Trainer(object):
 		self.args = args
 		self.model = model
 		self.model_teacher = model_teacher
-		self.generator = generator
 		self.train_loader = train_loader
 		self.test_loader = test_loader
 		self.tensorboard_logger = tensorboard_logger
@@ -49,6 +55,13 @@ class Trainer(object):
 		self.MSE_loss = nn.MSELoss().to(self.args.local_rank)
 		self.KLloss = nn.KLDivLoss(reduction='batchmean').to(self.args.local_rank)
 		self.lr_master_S = lr_master_S
+		self.lr_master_G = lr_master_G
+		self.logger = logger
+		
+		# Always use compute_singlecrop for accuracy calculation (no evaluator)
+		self.use_evaluator = False
+		self.task = 'multi-class'
+		self.logger.info("Using utils.compute_singlecrop for all accuracy calculations")
 		self.lr_master_G = lr_master_G
 		self.opt_type = opt_type
 		if opt_type == "SGD":
@@ -78,12 +91,8 @@ class Trainer(object):
 		else:
 			assert False, "invalid type: %d" % opt_type
 		if optimizer_state is not None:
-			self.optimizer_S.load_state_dict(optimizer_state)\
+			self.optimizer_S.load_state_dict(optimizer_state)
 
-		self.optimizer_G = torch.optim.Adam(self.generator.parameters(), lr=self.settings.lr_G,
-											betas=(self.settings.b1, self.settings.b2))
-
-		self.logger = logger
 		self.run_count = run_count
 		self.scalar_info = {}
 		self.mean_list = []
@@ -95,6 +104,7 @@ class Trainer(object):
 		self.activation_teacher = []
 		self.activation = []
 		self.handle_list = []
+		
 
 	def update_lr(self, epoch):
 		"""
@@ -106,8 +116,6 @@ class Trainer(object):
 		# update learning rate of model optimizer
 		for param_group in self.optimizer_S.param_groups:
 			param_group['lr'] = lr_S
-		for param_group in self.optimizer_G.param_groups:
-			param_group['lr'] = lr_G
 
 	def loss_fn_kd(self, output, labels, teacher_outputs):
 		"""
@@ -122,7 +130,21 @@ class Trainer(object):
 		a = F.log_softmax(output / T, dim=1)
 		b = F.softmax(teacher_outputs / T, dim=1)
 		c = (alpha * T * T)
-		d = self.criterion(output, labels)
+		
+		# Properly format labels for loss calculation
+		if self.settings.train_dataset != self.settings.test_dataset:
+			d = torch.tensor(0.0).to(self.args.local_rank)
+		else:
+			if len(labels.shape) > 1 and labels.shape[1] > 1:
+				# Multi-label case
+				labels_formatted = labels.to(torch.float32)
+				# For multi-label, use different loss function
+				d = self.bce_logits(output, labels_formatted)
+			else:
+				# Single-label case - squeeze if necessary
+				labels_formatted = torch.squeeze(labels, 1).long() if len(labels.shape) > 1 else labels.long()
+				d = self.criterion(output, labels_formatted)
+		
 		KD_loss = self.KLloss(a, b) * c
 		return KD_loss, d
 
@@ -143,13 +165,13 @@ class Trainer(object):
 		loss_FA = self.loss_fa()
 		return output, loss_KL, loss_FA, loss_CE
 	
-	def backward_G(self, loss_G):
-		"""
-		backward propagation
-		"""
-		self.optimizer_G.zero_grad()
-		loss_G.backward()
-		self.optimizer_G.step()
+	# def backward_G(self, loss_G):
+	# 	"""
+	# 	backward propagation
+	# 	"""
+	# 	self.optimizer_G.zero_grad()
+	# 	loss_G.backward()
+	# 	self.optimizer_G.step()
 
 	def backward_S(self, loss_S):
 		"""
@@ -163,10 +185,8 @@ class Trainer(object):
 		"""
 		backward propagation
 		"""
-		self.optimizer_G.zero_grad()
 		self.optimizer_S.zero_grad()
 		loss.backward()
-		self.optimizer_G.step()
 		self.optimizer_S.step()
 
 	def reduce_minmax(self):
@@ -209,141 +229,183 @@ class Trainer(object):
 		top5_error = utils.AverageMeter()
 		fp_acc = utils.AverageMeter()
 
-		iters = 200
 		self.update_lr(epoch)
 
-		self.model.eval()
+		self.model.train()
 		self.model_teacher.eval()
-		self.generator.train()
 		
 		start_time = time.time()
 		end_time = start_time
 		
+		self.logger.info(f"Starting training epoch {epoch + 1}/{self.settings.nEpochs}")
+		print(f"Starting training epoch {epoch + 1}/{self.settings.nEpochs}")
+		
 		if epoch==0:
 			#register BN hook
-			for m in self.model_teacher.module.modules():
+			for m in self.model_teacher.modules():
 				if isinstance(m, nn.SyncBatchNorm):
 					handle = m.register_forward_hook(self.hook_fn_forward)
 					self.handle_list.append(handle)
+			self.logger.info("Registered BN hooks for teacher model")
+			print("Registered BN hooks for teacher model")
+
 
 		if epoch == 4:
 			#remove BN hook
 			for handle in self.handle_list:
 				handle.remove()
 			self.reduce_minmax()
+			self.logger.info("Removed BN hooks and reduced minmax values")
+			print("Removed BN hooks and reduced minmax values")
 
-			for m in self.model_teacher.module.modules():
-				if isinstance(m, ResUnit):
-					m.body.register_forward_hook(self.hook_activation_teacher)
-				elif isinstance(m, DwsConvBlock):
-					m.pw_conv.bn.register_forward_hook(self.hook_activation_teacher)
-				elif isinstance(m, LinearBottleneck):
-					m.conv3.register_forward_hook(self.hook_activation_teacher)
-			for m in self.model.module.modules():
-				if isinstance(m, ResUnit):
-					m.body.register_forward_hook(self.hook_activation)
-				elif isinstance(m, DwsConvBlock):
-					m.pw_conv.bn.register_forward_hook(self.hook_activation)
-				elif isinstance(m, LinearBottleneck):
-					m.conv3.register_forward_hook(self.hook_activation)
+			# Register hooks for ResNet layers (layer1, layer2, layer3, layer4)
+			# Teacher model hooks
+			if hasattr(self.model_teacher, 'layer1'):
+				self.model_teacher.layer1.register_forward_hook(self.hook_activation_teacher)
+				print("Registered teacher layer1 hook")
+			if hasattr(self.model_teacher, 'layer2'):
+				self.model_teacher.layer2.register_forward_hook(self.hook_activation_teacher)
+				print("Registered teacher layer2 hook")
+			if hasattr(self.model_teacher, 'layer3'):
+				self.model_teacher.layer3.register_forward_hook(self.hook_activation_teacher)
+				print("Registered teacher layer3 hook")
+			if hasattr(self.model_teacher, 'layer4'):
+				self.model_teacher.layer4.register_forward_hook(self.hook_activation_teacher)
+				print("Registered teacher layer4 hook")
+			
+			# Student model hooks
+			if hasattr(self.model.module, 'layer1'):
+				self.model.module.layer1.register_forward_hook(self.hook_activation)
+				print("Registered student layer1 hook")
+			if hasattr(self.model.module, 'layer2'):
+				self.model.module.layer2.register_forward_hook(self.hook_activation)
+				print("Registered student layer2 hook")
+			if hasattr(self.model.module, 'layer3'):
+				self.model.module.layer3.register_forward_hook(self.hook_activation)
+				print("Registered student layer3 hook")
+			if hasattr(self.model.module, 'layer4'):
+				self.model.module.layer4.register_forward_hook(self.hook_activation)
+				print("Registered student layer4 hook")
+			
+			self.logger.info("Registered activation hooks for ResNet layers (layer1-4) for feature alignment")
+			print("Registered activation hooks for ResNet layers (layer1-4) for feature alignment")
 
-			self.generator = self.generator.cpu()
-			self.optimizer_G.zero_grad()
-			# del self.optimizer_G
-			# torch.cuda.empty_cache()
-
-		if direct_dataload is not None:
-			direct_dataload.sampler.set_epoch(epoch)
-			iterator = iter(direct_dataload)
-
-		for i in range(iters):
+		for i, (images, labels) in enumerate(self.train_loader):
 
 			start_time = time.time()
 			data_time = start_time - end_time
 
-			# torch.cuda.empty_cache()
+			# Move data to device
+			images, labels = images.to(self.args.local_rank), labels.to(self.args.local_rank)
 
 			if epoch < 4:
-				z = Variable(torch.randn(16, self.settings.latent_dim)).to(self.args.local_rank)
-				labels = Variable(torch.randint(0, self.settings.nClasses, (16,))).to(self.args.local_rank)
-				z = z.contiguous()
-				labels = labels.contiguous()
-				images = self.generator(z, labels)
-
+				# During early epochs, use BN statistics matching
 				self.mean_list.clear()
 				self.var_list.clear()
 				output_teacher_batch = self.model_teacher(images)
-
-				# One hot loss
-				loss_one_hot = self.criterion(output_teacher_batch, labels)
+				
+				# Train student model
+				output = self.model(images)
+				
+				# Properly format labels for loss calculation
+				if self.settings.train_dataset != self.settings.test_dataset:
+					loss_one_hot = torch.tensor(0.0).to(self.args.local_rank)
+				else:
+					if len(labels.shape) > 1 and labels.shape[1] > 1:
+						# Multi-label case
+						labels_formatted = labels.to(torch.float32)
+						loss_one_hot = self.criterion(output, labels_formatted)
+					else:
+						# Single-label case - squeeze if necessary
+						labels_formatted = torch.squeeze(labels, 1).long() if len(labels.shape) > 1 else labels.long()
+						loss_one_hot = self.criterion(output, labels_formatted)
+				
 				# BN statistic loss
 				BNS_loss = torch.zeros(1).to(self.args.local_rank)
 				for num in range(len(self.mean_list)):
 					BNS_loss += self.MSE_loss(self.mean_list[num], self.teacher_running_mean[num]) + self.MSE_loss(
 						self.var_list[num], self.teacher_running_var[num])
 
-				BNS_loss = BNS_loss / len(self.mean_list)
-				# loss of Generator
-				loss_G = loss_one_hot + 0.1 * BNS_loss
-				self.backward_G(loss_G)
-				output = self.model(images.detach())
-				loss_S = torch.zeros(1).to(self.args.local_rank)
+				if len(self.mean_list) > 0:
+					BNS_loss = BNS_loss / len(self.mean_list)
+				
+				loss_S = loss_one_hot + 0.1 * BNS_loss
+				# self.backward_S(loss_S)
 			else:
-
-				try:
-					images, labels = next(iterator)
-				except:
-					# self.logger.info('re-iterator of direct_dataload')
-					iterator = iter(direct_dataload)
-					images, labels = next(iterator)
-				images, labels = images.to(self.args.local_rank), labels.to(self.args.local_rank)
-
+				# After epoch 4, use feature alignment and knowledge distillation
 				self.activation_teacher.clear()
 				self.activation.clear()
 
-				images.requires_grad = True
 				output_teacher_batch = self.model_teacher(images)
 				output, loss_KL, loss_FA, loss_CE = self.forward(images, output_teacher_batch, labels)
-				loss_S = loss_KL + loss_FA
+				loss_S = loss_KL + loss_FA*0 + loss_CE*0
 
-				perturbation = torch.sgn(torch.autograd.grad(loss_S, images, retain_graph=True)[0])
 				self.activation_teacher.clear()
 				self.activation.clear()
-				with torch.no_grad():
-					images_perturbed = images + self.settings.eps * perturbation
-					output_teacher_batch_perturbed = self.model_teacher(images_perturbed.detach())
-				output_perturbed, loss_KL_perturbed, loss_FA_perturbed, loss_CE_perturbed = self.forward(images_perturbed.detach(), output_teacher_batch_perturbed.detach(), labels)
-				loss_S_perturbed = loss_KL_perturbed + loss_FA_perturbed
-				loss_total = 1 * loss_S + 1 * loss_S_perturbed
+
+				loss_total = loss_S 
 
 				self.backward_S(loss_total)
 
-			single_error, single_loss, single5_error = utils.compute_singlecrop(
-				outputs=output, labels=labels,
-				loss=loss_S, top5_flag=True, mean_flag=True)
-			
-			top1_error.update(single_error, images.size(0))
-			top1_loss.update(single_loss, images.size(0))
-			top5_error.update(single5_error, images.size(0))
-			
-			end_time = time.time()
-			
-			gt = labels.data.cpu().numpy()
-			d_acc = np.mean(np.argmax(output_teacher_batch.data.cpu().numpy(), axis=1) == gt)
-			fp_acc.update(d_acc)
+			# Use compute_singlecrop for accuracy calculation
+			if self.settings.train_dataset != self.settings.test_dataset:
+				# Log progress every 10 batches
+				if (i + 1) % 10 == 0:
+					if epoch < 4:
+						log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batch {i + 1}/{len(self.train_loader)}] [Student loss: {loss_S.item():.6f}] [One-hot loss: {loss_one_hot.item():.6f}] [BNS_loss:{BNS_loss.item():.6f}]"
+						self.logger.info(log_msg)
+						print(log_msg)
+					else:
+						log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batch {i + 1}/{len(self.train_loader)}] [loss KL: {loss_KL.item():.6f}] [loss FA: {loss_FA.item():.6f}] [loss CE: {loss_CE.item():.6f}]"
+						self.logger.info(log_msg)
+						print(log_msg)
+			else:
+				single_error, single_loss, single5_error = utils.compute_singlecrop(
+					outputs=output, labels=labels,
+					loss=loss_S, top5_flag=True, mean_flag=True)
+				
+				top1_error.update(single_error, images.size(0))
+				top1_loss.update(single_loss, images.size(0))
+				top5_error.update(single5_error, images.size(0))
+				
+				end_time = time.time()
+				
+				# Calculate accuracy from error rate
+				acc = 100.0 - single_error
+				fp_acc.update(acc)
+				
+				# Log progress every 10 batches
+				if (i + 1) % 10 == 0:
+					if epoch < 4:
+						log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batch {i + 1}/{len(self.train_loader)}] [acc: {fp_acc.avg:.4f}%] [Student loss: {loss_S.item():.6f}] [One-hot loss: {loss_one_hot.item():.6f}] [BNS_loss:{BNS_loss.item():.6f}]"
+						self.logger.info(log_msg)
+						print(log_msg)
+					else:
+						log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batch {i + 1}/{len(self.train_loader)}] [acc: {fp_acc.avg:.4f}%] [loss KL: {loss_KL.item():.6f}] [loss FA: {loss_FA.item():.6f}] [loss CE: {loss_CE.item():.6f}]"
+						self.logger.info(log_msg)
+						print(log_msg)
 		
-		if epoch < 4:
-			self.logger.info(
-				"[Epoch %d/%d] [Batch %d/%d] [acc: %.4f%%] [G loss: %f] [One-hot loss: %f] [BNS_loss:%f]"
-				% (epoch + 1, self.settings.nEpochs, i + 1, iters, 100 * fp_acc.avg, loss_G.item(),
-				   loss_one_hot.item(), BNS_loss.item())
-			)
+		# Log progress at the end of epoch
+		if self.settings.train_dataset != self.settings.test_dataset:
+			if epoch < 4:
+				final_log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batches: {len(self.train_loader)}] [Student loss: {loss_S.item():.6f}] [One-hot loss: {loss_one_hot.item():.6f}] [BNS_loss:{BNS_loss.item():.6f}]"
+				self.logger.info(final_log_msg)
+				print(final_log_msg)
+			else:
+				final_log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batches: {len(self.train_loader)}] [loss KL: {loss_KL.item():.6f}] [loss FA: {loss_FA.item():.6f}]"
+				self.logger.info(final_log_msg)
+				print(final_log_msg)
 		else:
-			self.logger.info(
-				"[Epoch %d/%d] [Batch %d/%d] [acc: %.4f%%] [loss KL: %f] [loss FA: %f] [loss perturbed KL: %f] [loss perturbed FA: %f] "
-				% (epoch + 1, self.settings.nEpochs, i+1, iters, 100 * fp_acc.avg, loss_KL.item(), loss_FA.item(), loss_KL_perturbed.item(), loss_FA_perturbed.item())
-			)
+			if epoch < 4:
+				final_log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batches: {len(self.train_loader)}] [acc: {fp_acc.avg:.4f}%] [Student loss: {loss_S.item():.6f}] [One-hot loss: {loss_one_hot.item():.6f}] [BNS_loss:{BNS_loss.item():.6f}]"
+				self.logger.info(final_log_msg)
+				print(final_log_msg)
+			else:
+				final_log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batches: {len(self.train_loader)}] [acc: {fp_acc.avg:.4f}%] [loss KL: {loss_KL.item():.6f}] [loss FA: {loss_FA.item():.6f}]"
+				self.logger.info(final_log_msg)
+				print(final_log_msg)
 
+			
 		# self.scalar_info['accuracy every epoch'] = 100 * d_acc
 		# self.scalar_info['training_top1error'] = top1_error.avg
 		# self.scalar_info['training_top5error'] = top5_error.avg
@@ -393,6 +455,10 @@ class Trainer(object):
 				
 				end_time = time.time()
 		self.logger.info(
+			"[Epoch %d/%d] [Batch %d/%d] [acc: %.4f%%]"
+			% (epoch + 1, self.settings.nEpochs, i + 1, iters, (100.00-top1_error.avg))
+		)
+		print(
 			"[Epoch %d/%d] [Batch %d/%d] [acc: %.4f%%]"
 			% (epoch + 1, self.settings.nEpochs, i + 1, iters, (100.00-top1_error.avg))
 		)

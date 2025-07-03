@@ -12,11 +12,14 @@ class Option(NetOption):
 		self.conf = ConfigFactory.parse_file(conf_path)
 		#  ------------ General options ----------------------------------------
 		self.model_name = self.conf['model_name']
-		self.generateDataPath = self.conf['generateDataPath']
-		self.generateLabelPath = self.conf['generateLabelPath']
-		self.dataPath = self.conf['dataPath']  # path for loading data set
-		self.dataset = self.conf['dataset']  # options: imagenet | cifar100
-		
+		# self.generateDataPath = self.conf['generateDataPath']
+		# self.generateLabelPath = self.conf['generateLabelPath']
+		# self.dataPath = self.conf['dataPath']  # path for loading data set
+		# self.dataset = self.conf['dataset']  # options: imagenet | cifar100
+		self.train_dataPath = self.conf['train_dataPath']  # path for training data set
+		self.test_dataPath = self.conf['test_dataPath']  # path for test data set
+		self.train_dataset = self.conf['train_dataset']  # training dataset
+		self.test_dataset = self.conf['test_dataset']  # test dataset
 		# ------------- Data options -------------------------------------------
 		self.nThreads = self.conf['nThreads']  # number of data loader threads
 		
