@@ -18,6 +18,7 @@ from pytorchcv.models.resnet import ResUnit
 from models.models import Bottleneck, BasicBlock
 from quantization_utils.quant_modules import *
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 try:
 	import medmnist
@@ -28,6 +29,70 @@ except ImportError:
 
 
 __all__ = ["Trainer"]
+
+
+class NewBatchNorm2d(nn.Module):
+	"""
+	New BatchNorm layer that uses current input statistics for normalization
+	but applies old beta and gamma parameters for scale and shift
+	"""
+	def __init__(self, original_bn):
+		super(NewBatchNorm2d, self).__init__()
+		self.num_features = original_bn.num_features
+		self.eps = original_bn.eps
+		self.momentum = original_bn.momentum
+		
+		# Store original parameters (old_beta, old_gamma)
+		self.register_buffer('old_weight', original_bn.weight.clone().detach())
+		self.register_buffer('old_bias', original_bn.bias.clone().detach())
+		
+		# Running statistics for new BN (will be updated during training)
+		self.register_buffer('running_mean', torch.zeros(self.num_features))
+		self.register_buffer('running_var', torch.ones(self.num_features))
+		self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
+		
+		# Store reference to original BN for easy restoration
+		self.original_bn = original_bn
+	
+	def forward(self, input):
+		# Use in-place operations and avoid unnecessary tensor creation
+		if self.training:
+			# Calculate mean and variance from current batch more efficiently
+			batch_mean = input.mean([0, 2, 3], keepdim=False)
+			batch_var = input.var([0, 2, 3], unbiased=False, keepdim=False)
+			
+			# # Update running statistics with in-place operations
+			# if self.momentum is None:
+			# 	exponential_average_factor = 0.0
+			# else:
+			# 	exponential_average_factor = self.momentum
+			
+			# # In-place updates to save memory
+			# with torch.no_grad():
+			# 	self.running_mean.mul_(1 - exponential_average_factor).add_(batch_mean, alpha=exponential_average_factor)
+			# 	self.running_var.mul_(1 - exponential_average_factor).add_(batch_var, alpha=exponential_average_factor)
+			
+			# Use batch statistics for normalization
+			mean = batch_mean.detach()  # Detach to prevent requires_grad issues
+			var = batch_var.detach()    # Detach to prevent requires_grad issues
+		else:
+			# Use running statistics for normalization during evaluation
+			mean = self.running_mean.detach()  # Detach to prevent requires_grad issues
+			var = self.running_var.detach()    # Detach to prevent requires_grad issues
+		
+		# Use F.batch_norm for efficient computation instead of manual operations
+		# This is more memory efficient than manual tensor operations
+		# Detach mean and var to avoid autograd issues with running statistics
+		return F.batch_norm(
+			input, 
+			mean.detach(), 
+			var.detach(), 
+			self.old_weight, 
+			self.old_bias, 
+			training=False,  # We handle the statistics ourselves
+			momentum=0.0,    # No momentum since we handle it ourselves
+			eps=self.eps
+		)
 
 
 class Trainer(object):
@@ -57,6 +122,10 @@ class Trainer(object):
 		self.lr_master_S = lr_master_S
 		self.lr_master_G = lr_master_G
 		self.logger = logger
+		
+		# Store original BN layers for test time
+		self.original_bn_layers = {}
+		self.new_bn_layers = {}
 		
 		# Always use compute_singlecrop for accuracy calculation (no evaluator)
 		self.use_evaluator = False
@@ -165,13 +234,13 @@ class Trainer(object):
 		loss_FA = self.loss_fa()
 		return output, loss_KL, loss_FA, loss_CE
 	
-	# def backward_G(self, loss_G):
-	# 	"""
-	# 	backward propagation
-	# 	"""
-	# 	self.optimizer_G.zero_grad()
-	# 	loss_G.backward()
-	# 	self.optimizer_G.step()
+	def backward_G(self, loss_G):
+		"""
+		backward propagation
+		"""
+		self.optimizer_G.zero_grad()
+		loss_G.backward()
+		self.optimizer_G.step()
 
 	def backward_S(self, loss_S):
 		"""
@@ -219,7 +288,125 @@ class Trainer(object):
 		self.var_list.append(var)
 		self.teacher_running_mean.append(module.running_mean)
 		self.teacher_running_var.append(module.running_var)
+
+	def freeze_batchnorm(self, model):
+		"""
+		freeze all BatchNorm parameters (weight, bias, running_mean, running_var)
+		"""
+		if isinstance(model, DDP):
+			model = model.module
+			
+		for module in model.modules():
+			if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)):
+				# Set to eval mode to prevent running statistics update
+				# module.train()
+				# module.eval()
+				
+				# Freeze parameters
+				if module.weight is not None:
+					module.weight.requires_grad = False
+				if module.bias is not None:
+					module.bias.requires_grad = False
+				
+				# Optionally freeze running statistics (they won't update in eval mode anyway)
+				module.track_running_stats = False
+				print(f"Freezing BatchNorm module: {type(module).__name__}")
 	
+	def unfreeze_batchnorm(self, model):
+		"""
+		unfreeze all BatchNorm parameters
+		"""
+		if isinstance(model, DDP):
+			model = model.module
+			
+		for module in model.modules():
+			if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)):
+				# Unfreeze parameters
+				if module.weight is not None:
+					module.weight.requires_grad = True
+				if module.bias is not None:
+					module.bias.requires_grad = True
+				# Allow running statistics update
+				module.track_running_stats = True
+	
+	def freeze_classifier(self, model):
+		"""
+		freeze the classifier (last layer) parameters
+		"""
+		if isinstance(model, DDP):
+			model = model.module
+		
+		# Common classifier layer names in different architectures
+		classifier_names = ['fc', 'classifier', 'linear', 'head']
+		
+		for name, module in model.named_modules():
+			# Check if this is likely the final classifier layer
+			if any(classifier_name in name.lower() for classifier_name in classifier_names):
+				# Additional check: should be a Linear layer and likely the last one
+				if isinstance(module, (nn.Linear, Quant_Linear)):
+					# Freeze parameters
+					if module.weight is not None:
+						module.weight.requires_grad = False
+						print(f"Freezing classifier weight: {name}")
+					if module.bias is not None:
+						module.bias.requires_grad = False
+						print(f"Freezing classifier bias: {name}")
+		
+		# Alternative approach: freeze the last Linear layer
+		last_linear = None
+		last_linear_name = ""
+		for name, module in model.named_modules():
+			if isinstance(module, nn.Linear):
+				last_linear = module
+				last_linear_name = name
+		
+		if last_linear is not None and last_linear_name:
+			if last_linear.weight is not None:
+				last_linear.weight.requires_grad = False
+				print(f"Freezing last linear layer weight: {last_linear_name}")
+			if last_linear.bias is not None:
+				last_linear.bias.requires_grad = False
+				print(f"Freezing last linear layer bias: {last_linear_name}")
+	
+	def unfreeze_classifier(self, model):
+		"""
+		unfreeze the classifier (last layer) parameters
+		"""
+		if isinstance(model, DDP):
+			model = model.module
+		
+		# Common classifier layer names in different architectures
+		classifier_names = ['fc', 'classifier', 'linear', 'head']
+		
+		for name, module in model.named_modules():
+			# Check if this is likely the final classifier layer
+			if any(classifier_name in name.lower() for classifier_name in classifier_names):
+				# Additional check: should be a Linear layer
+				if isinstance(module, nn.Linear):
+					# Unfreeze parameters
+					if module.weight is not None:
+						module.weight.requires_grad = True
+						print(f"Unfreezing classifier weight: {name}")
+					if module.bias is not None:
+						module.bias.requires_grad = True
+						print(f"Unfreezing classifier bias: {name}")
+		
+		# Alternative approach: unfreeze the last Linear layer
+		last_linear = None
+		last_linear_name = ""
+		for name, module in model.named_modules():
+			if isinstance(module, nn.Linear):
+				last_linear = module
+				last_linear_name = name
+		
+		if last_linear is not None and last_linear_name:
+			if last_linear.weight is not None:
+				last_linear.weight.requires_grad = True
+				print(f"Unfreezing last linear layer weight: {last_linear_name}")
+			if last_linear.bias is not None:
+				last_linear.bias.requires_grad = True
+				print(f"Unfreezing last linear layer bias: {last_linear_name}")
+
 	def train(self, epoch, direct_dataload=None):
 		"""
 		training
@@ -228,17 +415,31 @@ class Trainer(object):
 		top1_loss = utils.AverageMeter()
 		top5_error = utils.AverageMeter()
 		fp_acc = utils.AverageMeter()
+		loss_train = utils.AverageMeter()  # Add average meter for loss_total
 
 		self.update_lr(epoch)
 
 		self.model.train()
 		self.model_teacher.eval()
+
+		# Switch to new BN mode for training
+		self.switch_to_new_bn_mode()
+		
+		# Clear CUDA cache at the beginning of each epoch
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
 		
 		start_time = time.time()
 		end_time = start_time
 		
 		self.logger.info(f"Starting training epoch {epoch + 1}/{self.settings.nEpochs}")
 		print(f"Starting training epoch {epoch + 1}/{self.settings.nEpochs}")
+		
+		# Initialize class counters for training predictions
+		num_classes = getattr(self.settings, 'nClasses', 8)  # Default to 8 for tissuemnist
+		student_pred_counts = [0] * num_classes
+		teacher_pred_counts = [0] * num_classes
+		true_train_counts = [0] * num_classes
 		
 		if epoch==0:
 			#register BN hook
@@ -290,6 +491,11 @@ class Trainer(object):
 			self.logger.info("Registered activation hooks for ResNet layers (layer1-4) for feature alignment")
 			print("Registered activation hooks for ResNet layers (layer1-4) for feature alignment")
 
+			# self.freeze_batchnorm(self.model)
+			# self.freeze_classifier(self.model)
+			# self.logger.info(f"Epoch {epoch}: Freezed BatchNorm and classifier parameters")
+			# print(f"Epoch {epoch}: Freezed BatchNorm and classifier parameters")
+
 		for i, (images, labels) in enumerate(self.train_loader):
 
 			start_time = time.time()
@@ -300,12 +506,38 @@ class Trainer(object):
 
 			if epoch < 4:
 				# During early epochs, use BN statistics matching
+
 				self.mean_list.clear()
 				self.var_list.clear()
 				output_teacher_batch = self.model_teacher(images)
 				
 				# Train student model
 				output = self.model(images)
+				
+				# Count predictions for both models
+				with torch.no_grad():
+					_, student_predicted = torch.max(output.data, 1)
+					_, teacher_predicted = torch.max(output_teacher_batch.data, 1)
+					
+					# Count true labels and predictions
+					for j in range(labels.size(0)):
+						# Handle true labels
+						true_label = labels[j].item()
+						if len(labels.shape) > 1 and labels.shape[1] > 1:
+							true_label = torch.squeeze(labels[j], 0).long().item() if len(labels[j].shape) > 0 else labels[j].item()
+						elif len(labels.shape) > 1:
+							true_label = torch.squeeze(labels[j], 0).long().item()
+						
+						student_pred = student_predicted[j].item()
+						teacher_pred = teacher_predicted[j].item()
+						
+						# Count if within valid range
+						if 0 <= true_label < num_classes:
+							true_train_counts[true_label] += 1
+						if 0 <= student_pred < num_classes:
+							student_pred_counts[student_pred] += 1
+						if 0 <= teacher_pred < num_classes:
+							teacher_pred_counts[teacher_pred] += 1
 				
 				# Properly format labels for loss calculation
 				if self.settings.train_dataset != self.settings.test_dataset:
@@ -330,22 +562,83 @@ class Trainer(object):
 					BNS_loss = BNS_loss / len(self.mean_list)
 				
 				loss_S = loss_one_hot + 0.1 * BNS_loss
+				
+				# Update loss_total average for epoch < 4
+				loss_train.update(loss_S.item(), images.size(0))
+				
+				# Backward pass for early epochs
 				# self.backward_S(loss_S)
+				
+				# Clear intermediate variables to free memory
+				del output_teacher_batch, output
+				if 'labels_formatted' in locals():
+					del labels_formatted
+
 			else:
 				# After epoch 4, use feature alignment and knowledge distillation
+				# Unfreeze model parameters for normal training
+				for param in self.model.parameters():
+					param.requires_grad = True
+				
 				self.activation_teacher.clear()
 				self.activation.clear()
 
 				output_teacher_batch = self.model_teacher(images)
 				output, loss_KL, loss_FA, loss_CE = self.forward(images, output_teacher_batch, labels)
-				loss_S = loss_KL + loss_FA*0 + loss_CE*0
+				
+				# Add entropy loss to prevent mode collapse
+				loss_entropy = self.entropy_loss(output)
+				loss_diversity = self.prediction_diversity_loss(output)
+				
+				# Combine all losses
+				# You can adjust the weights (0.1 for entropy, 0.05 for diversity) based on your needs
+				loss_S = loss_KL + loss_FA + loss_CE*0 + loss_entropy*0 + loss_diversity*0
+
+				# Count predictions for both models
+				with torch.no_grad():
+					_, student_predicted = torch.max(output.data, 1)
+					_, teacher_predicted = torch.max(output_teacher_batch.data, 1)
+					
+					# Count true labels and predictions
+					for j in range(labels.size(0)):
+						# Handle true labels
+						true_label = labels[j].item()
+						if len(labels.shape) > 1 and labels.shape[1] > 1:
+							true_label = torch.squeeze(labels[j], 0).long().item() if len(labels[j].shape) > 0 else labels[j].item()
+						elif len(labels.shape) > 1:
+							true_label = torch.squeeze(labels[j], 0).long().item()
+						
+						student_pred = student_predicted[j].item()
+						teacher_pred = teacher_predicted[j].item()
+						
+						# Count if within valid range
+						if 0 <= true_label < num_classes:
+							true_train_counts[true_label] += 1
+						if 0 <= student_pred < num_classes:
+							student_pred_counts[student_pred] += 1
+						if 0 <= teacher_pred < num_classes:
+							teacher_pred_counts[teacher_pred] += 1
 
 				self.activation_teacher.clear()
 				self.activation.clear()
 
 				loss_total = loss_S 
 
+				# Update loss_total average for epoch >= 4
+				loss_train.update(loss_total.item(), images.size(0))
+
 				self.backward_S(loss_total)
+			
+			# Clear intermediate variables to free memory
+			del images, labels
+			if 'output_teacher_batch' in locals():
+				del output_teacher_batch
+			if 'output' in locals():
+				del output
+			
+			# Clear CUDA cache periodically to prevent memory accumulation
+			if (i + 1) % 5 == 0 and torch.cuda.is_available():
+				torch.cuda.empty_cache()
 
 			# Use compute_singlecrop for accuracy calculation
 			if self.settings.train_dataset != self.settings.test_dataset:
@@ -356,7 +649,7 @@ class Trainer(object):
 						self.logger.info(log_msg)
 						print(log_msg)
 					else:
-						log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batch {i + 1}/{len(self.train_loader)}] [loss KL: {loss_KL.item():.6f}] [loss FA: {loss_FA.item():.6f}] [loss CE: {loss_CE.item():.6f}]"
+						log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batch {i + 1}/{len(self.train_loader)}] [loss KL: {loss_KL.item():.6f}] [loss FA: {loss_FA.item():.6f}] [loss CE: {loss_CE.item():.6f}] [loss Ent: {loss_entropy.item():.6f}] [loss Div: {loss_diversity.item():.6f}]"
 						self.logger.info(log_msg)
 						print(log_msg)
 			else:
@@ -381,18 +674,42 @@ class Trainer(object):
 						self.logger.info(log_msg)
 						print(log_msg)
 					else:
-						log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batch {i + 1}/{len(self.train_loader)}] [acc: {fp_acc.avg:.4f}%] [loss KL: {loss_KL.item():.6f}] [loss FA: {loss_FA.item():.6f}] [loss CE: {loss_CE.item():.6f}]"
+						log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batch {i + 1}/{len(self.train_loader)}] [acc: {fp_acc.avg:.4f}%] [loss KL: {loss_KL.item():.6f}] [loss FA: {loss_FA.item():.6f}] [loss CE: {loss_CE.item():.6f}] [loss Ent: {loss_entropy.item():.6f}] [loss Div: {loss_diversity.item():.6f}]"
 						self.logger.info(log_msg)
 						print(log_msg)
 		
 		# Log progress at the end of epoch
+		print(f"\n=== Training Results for Epoch {epoch + 1} ===")
+		print("True class distribution in training:")
+		total_true_train = sum(true_train_counts)
+		for class_idx in range(num_classes):
+			count = true_train_counts[class_idx]
+			percentage = (count / total_true_train) * 100 if total_true_train > 0 else 0
+			print(f"  Class {class_idx}: {count} images ({percentage:.2f}%)")
+		
+		print("Student model predictions:")
+		total_student_pred = sum(student_pred_counts)
+		for class_idx in range(num_classes):
+			count = student_pred_counts[class_idx]
+			percentage = (count / total_student_pred) * 100 if total_student_pred > 0 else 0
+			print(f"  Class {class_idx}: {count} images ({percentage:.2f}%)")
+		
+		print("Teacher model predictions:")
+		total_teacher_pred = sum(teacher_pred_counts)
+		for class_idx in range(num_classes):
+			count = teacher_pred_counts[class_idx]
+			percentage = (count / total_teacher_pred) * 100 if total_teacher_pred > 0 else 0
+			print(f"  Class {class_idx}: {count} images ({percentage:.2f}%)")
+		print(f"Total training samples: {total_true_train}")
+		print()
+		
 		if self.settings.train_dataset != self.settings.test_dataset:
 			if epoch < 4:
 				final_log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batches: {len(self.train_loader)}] [Student loss: {loss_S.item():.6f}] [One-hot loss: {loss_one_hot.item():.6f}] [BNS_loss:{BNS_loss.item():.6f}]"
 				self.logger.info(final_log_msg)
 				print(final_log_msg)
 			else:
-				final_log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batches: {len(self.train_loader)}] [loss KL: {loss_KL.item():.6f}] [loss FA: {loss_FA.item():.6f}]"
+				final_log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batches: {len(self.train_loader)}] [loss KL: {loss_KL.item():.6f}] [loss FA: {loss_FA.item():.6f}] [loss Ent: {loss_entropy.item():.6f}] [loss Div: {loss_diversity.item():.6f}]"
 				self.logger.info(final_log_msg)
 				print(final_log_msg)
 		else:
@@ -401,7 +718,7 @@ class Trainer(object):
 				self.logger.info(final_log_msg)
 				print(final_log_msg)
 			else:
-				final_log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batches: {len(self.train_loader)}] [acc: {fp_acc.avg:.4f}%] [loss KL: {loss_KL.item():.6f}] [loss FA: {loss_FA.item():.6f}]"
+				final_log_msg = f"[Epoch {epoch + 1}/{self.settings.nEpochs}] [Batches: {len(self.train_loader)}] [acc: {fp_acc.avg:.4f}%] [loss KL: {loss_KL.item():.6f}] [loss FA: {loss_FA.item():.6f}] [loss Ent: {loss_entropy.item():.6f}] [loss Div: {loss_diversity.item():.6f}]"
 				self.logger.info(final_log_msg)
 				print(final_log_msg)
 
@@ -416,13 +733,16 @@ class Trainer(object):
 		# 		self.tensorboard_logger.scalar_summary(tag, value, self.run_count)
 		# 	self.scalar_info = {}
 
-		return top1_error.avg, top1_loss.avg, top5_error.avg
+		return top1_error.avg, loss_train.avg, top5_error.avg
 
 
 	def test(self, epoch):
 		"""
 		testing
 		"""
+		# Switch to original BN mode for testing
+		self.switch_to_original_bn_mode()
+		
 		top1_error = utils.AverageMeter()
 		top1_loss = utils.AverageMeter()
 		top5_error = utils.AverageMeter()
@@ -433,6 +753,12 @@ class Trainer(object):
 		iters = len(self.test_loader)
 		start_time = time.time()
 		end_time = start_time
+		
+		# Initialize class counters
+		num_classes = getattr(self.settings, 'nClasses', 8)  # Default to 8 for tissuemnist
+		true_class_counts = [0] * num_classes
+		pred_class_counts = [0] * num_classes
+		
 		# g=[]
 		with torch.no_grad():
 			for i, (images, labels) in enumerate(self.test_loader):
@@ -445,6 +771,28 @@ class Trainer(object):
 				self.mean_list.clear()
 				self.var_list.clear()
 
+				# Get predictions
+				_, predicted = torch.max(output.data, 1)
+				
+				# Count true and predicted classes
+				for j in range(labels.size(0)):
+					true_label = labels[j].item()
+					pred_label = predicted[j].item()
+					
+					# Handle different label formats
+					if len(labels.shape) > 1 and labels.shape[1] > 1:
+						# Multi-dimensional labels - take the first element or squeeze
+						true_label = torch.squeeze(labels[j], 0).long().item() if len(labels[j].shape) > 0 else labels[j].item()
+					elif len(labels.shape) > 1:
+						# Squeeze if necessary
+						true_label = torch.squeeze(labels[j], 0).long().item()
+					
+					# Ensure labels are within valid range
+					if 0 <= true_label < num_classes:
+						true_class_counts[true_label] += 1
+					if 0 <= pred_label < num_classes:
+						pred_class_counts[pred_label] += 1
+
 				single_error, single_loss, single5_error = utils.compute_singlecrop(
 					outputs=output, loss=loss,
 					labels=labels, top5_flag=True, mean_flag=True)
@@ -454,6 +802,25 @@ class Trainer(object):
 				top5_error.update(single5_error, images.size(0))
 				
 				end_time = time.time()
+		
+		# Print class distribution
+		print(f"\n=== Test Results for Epoch {epoch + 1} ===")
+		print("True class distribution:")
+		total_true = sum(true_class_counts)
+		for class_idx in range(num_classes):
+			count = true_class_counts[class_idx]
+			percentage = (count / total_true) * 100 if total_true > 0 else 0
+			print(f"  Class {class_idx}: {count} images ({percentage:.2f}%)")
+		
+		print("Predicted class distribution:")
+		total_pred = sum(pred_class_counts)
+		for class_idx in range(num_classes):
+			count = pred_class_counts[class_idx]
+			percentage = (count / total_pred) * 100 if total_pred > 0 else 0
+			print(f"  Class {class_idx}: {count} images ({percentage:.2f}%)")
+		print(f"Total test samples: {total_true}")
+		print()
+		
 		self.logger.info(
 			"[Epoch %d/%d] [Batch %d/%d] [acc: %.4f%%]"
 			% (epoch + 1, self.settings.nEpochs, i + 1, iters, (100.00-top1_error.avg))
@@ -472,6 +839,7 @@ class Trainer(object):
 		# 	self.scalar_info = {}
 		self.run_count += 1
 
+
 		return top1_error.avg, top1_loss.avg, top5_error.avg
 
 
@@ -479,6 +847,9 @@ class Trainer(object):
 		"""
 		testing
 		"""
+		# Switch to original BN mode for testing
+		self.switch_to_original_bn_mode()
+		
 		top1_error = utils.AverageMeter()
 		top1_loss = utils.AverageMeter()
 		top5_error = utils.AverageMeter()
@@ -488,6 +859,11 @@ class Trainer(object):
 		iters = len(self.test_loader)
 		start_time = time.time()
 		end_time = start_time
+		
+		# Initialize class counters for teacher model
+		num_classes = getattr(self.settings, 'nClasses', 8)  # Default to 8 for tissuemnist
+		true_class_counts = [0] * num_classes
+		teacher_pred_counts = [0] * num_classes
 
 		with torch.no_grad():
 			for i, (images, labels) in enumerate(self.test_loader):
@@ -519,6 +895,28 @@ class Trainer(object):
 					self.activation_teacher.clear()
 					output = self.model_teacher(images)
 
+					# Get predictions for class counting
+					_, teacher_predicted = torch.max(output.data, 1)
+					
+					# Count true and predicted classes
+					for j in range(labels.size(0)):
+						true_label = labels[j].item()
+						teacher_pred = teacher_predicted[j].item()
+						
+						# Handle different label formats
+						if len(labels.shape) > 1 and labels.shape[1] > 1:
+							# Multi-dimensional labels - take the first element or squeeze
+							true_label = torch.squeeze(labels[j], 0).long().item() if len(labels[j].shape) > 0 else labels[j].item()
+						elif len(labels.shape) > 1:
+							# Squeeze if necessary
+							true_label = torch.squeeze(labels[j], 0).long().item()
+						
+						# Ensure labels are within valid range
+						if 0 <= true_label < num_classes:
+							true_class_counts[true_label] += 1
+						if 0 <= teacher_pred < num_classes:
+							teacher_pred_counts[teacher_pred] += 1
+
 					loss = torch.ones(1)
 					self.mean_list.clear()
 					self.var_list.clear()
@@ -534,6 +932,24 @@ class Trainer(object):
 				end_time = time.time()
 				iter_time = end_time - start_time
 
+		# Print teacher class distribution
+		print(f"\n=== Teacher Test Results for Epoch {epoch + 1} ===")
+		print("True class distribution:")
+		total_true = sum(true_class_counts)
+		for class_idx in range(num_classes):
+			count = true_class_counts[class_idx]
+			percentage = (count / total_true) * 100 if total_true > 0 else 0
+			print(f"  Class {class_idx}: {count} images ({percentage:.2f}%)")
+		
+		print("Teacher model predictions:")
+		total_teacher_pred = sum(teacher_pred_counts)
+		for class_idx in range(num_classes):
+			count = teacher_pred_counts[class_idx]
+			percentage = (count / total_teacher_pred) * 100 if total_teacher_pred > 0 else 0
+			print(f"  Class {class_idx}: {count} images ({percentage:.2f}%)")
+		print(f"Total test samples: {total_true}")
+		print()
+
 		print(
 				"Teacher network: [Epoch %d/%d] [Batch %d/%d] [acc: %.4f%%]"
 				% (epoch + 1, self.settings.nEpochs, i + 1, iters, (100.00 - top1_error.avg))
@@ -541,4 +957,139 @@ class Trainer(object):
 
 		self.run_count += 1
 
+
 		return top1_error.avg, top1_loss.avg, top5_error.avg
+	
+	def entropy_loss(self, logits):
+		"""
+		Compute entropy loss to prevent mode collapse
+		Higher entropy encourages the model to make diverse predictions
+		"""
+		# Convert logits to probabilities
+		probs = F.softmax(logits, dim=1)
+		
+		# Compute entropy for each sample: -sum(p * log(p))
+		log_probs = F.log_softmax(logits, dim=1)
+		entropy_per_sample = -torch.sum(probs * log_probs, dim=1)
+		
+		# Return negative entropy (we want to maximize entropy, so minimize negative entropy)
+		return -torch.mean(entropy_per_sample)
+	
+	def prediction_diversity_loss(self, logits):
+		"""
+		Compute prediction diversity loss to encourage diverse predictions across the batch
+		This helps prevent mode collapse by encouraging different samples to have different predictions
+		"""
+		# Get prediction probabilities
+		probs = F.softmax(logits, dim=1)
+		
+		# Compute mean prediction distribution across the batch
+		mean_probs = torch.mean(probs, dim=0)
+		
+		# Compute entropy of the mean distribution
+		# Higher entropy means more diverse predictions across the batch
+		log_mean_probs = torch.log(mean_probs + 1e-8)  # Add small epsilon to avoid log(0)
+		diversity_entropy = -torch.sum(mean_probs * log_mean_probs)
+		
+		# Return negative entropy (we want to maximize diversity entropy)
+		return -diversity_entropy
+	
+	def replace_bn_with_new_bn(self, model, model_name="model"):
+		"""
+		Replace all BatchNorm layers with NewBatchNorm2d layers
+		"""
+		if isinstance(model, DDP):
+			model = model.module
+		
+		# Clear cache before replacement
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+		
+		def replace_bn_recursive(module, name=""):
+			for child_name, child_module in module.named_children():
+				full_name = f"{name}.{child_name}" if name else child_name
+				
+				if isinstance(child_module, (nn.BatchNorm2d, nn.SyncBatchNorm)):
+					# Store original BN layer
+					original_key = f"{model_name}.{full_name}"
+					if original_key not in self.original_bn_layers:
+						self.original_bn_layers[original_key] = child_module
+					
+					# Create new BN layer only if not already created
+					if original_key not in self.new_bn_layers:
+						new_bn = NewBatchNorm2d(child_module)
+						new_bn = new_bn.to(child_module.weight.device)
+						self.new_bn_layers[original_key] = new_bn
+					else:
+						new_bn = self.new_bn_layers[original_key]
+					
+					# Replace the module
+					setattr(module, child_name, new_bn)
+					# print(f"Replaced {full_name} with NewBatchNorm2d in {model_name}")
+				else:
+					# Recursively replace in child modules
+					replace_bn_recursive(child_module, full_name)
+		
+		replace_bn_recursive(model)
+		
+		# Clear cache after replacement
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+	
+	def restore_original_bn(self, model, model_name="model"):
+		"""
+		Restore original BatchNorm layers for testing
+		"""
+		if isinstance(model, DDP):
+			model = model.module
+		
+		# Clear cache before restoration
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+		
+		def restore_bn_recursive(module, name=""):
+			for child_name, child_module in module.named_children():
+				full_name = f"{name}.{child_name}" if name else child_name
+				
+				if isinstance(child_module, NewBatchNorm2d):
+					# Get original BN layer
+					original_key = f"{model_name}.{full_name}"
+					if original_key in self.original_bn_layers:
+						original_bn = self.original_bn_layers[original_key]
+						
+						# Restore the original module
+						setattr(module, child_name, original_bn)
+						# print(f"Restored original BN for {full_name} in {model_name}")
+				else:
+					# Recursively restore in child modules
+					restore_bn_recursive(child_module, full_name)
+		
+		restore_bn_recursive(model)
+		
+		# Clear cache after restoration
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+	
+	def switch_to_new_bn_mode(self):
+		"""
+		Switch both teacher and student models to use new BN layers for training
+		"""
+		print("Switching to new BN mode for training...")
+		# Clear CUDA cache before switching
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+		
+		self.replace_bn_with_new_bn(self.model_teacher, "teacher")
+		self.replace_bn_with_new_bn(self.model, "student")
+	
+	def switch_to_original_bn_mode(self):
+		"""
+		Switch both teacher and student models to use original BN layers for testing
+		"""
+		print("Switching to original BN mode for testing...")
+		# Clear CUDA cache before switching
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+		
+		self.restore_original_bn(self.model_teacher, "teacher")
+		self.restore_original_bn(self.model, "student")

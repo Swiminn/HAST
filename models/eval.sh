@@ -9,17 +9,17 @@ export CUDA_VISIBLE_DEVICES=1
 # Dataset and model configuration
 DATA_FLAG="tissuemnist"
 MODEL_FLAG="resnet18"
-MODEL_PATH="/home/suyoung/Vscode/SynQ/src/models/checkpoints/weights_tissuemnist/resnet18_28_1.pth"
+MODEL_PATH="/home/suyoung/Vscode/SynQ/src/models/checkpoints/weights_tissuemnist/resnet18_224_1.pth"
 GPU_IDS="1"
-SIZE=28
-BATCH_SIZE=128
+SIZE=224
+BATCH_SIZE=64
 OUTPUT_ROOT="./output_eval"
-RUN="eval_dermamnist_resnet18"
+RUN="eval_tissuemnist_resnet18"
 
 # Set number of epochs to 0 for evaluation only
 NUM_EPOCHS=0
 
-echo "Starting TissueMNIST evaluation..."
+echo "Starting tissueMNIST evaluation..."
 echo "Dataset: $DATA_FLAG"
 echo "Model: $MODEL_FLAG"
 echo "Model Path: $MODEL_PATH"

@@ -49,19 +49,20 @@ def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download
 
     print('==> Preparing data...')
 
-    if resize:
-        data_transform = transforms.Compose(
-            [transforms.Resize((224, 224), interpolation=PIL.Image.NEAREST), 
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[.5], std=[.5])])
-    else:
-        data_transform = transforms.Compose(
-            [transforms.ToTensor(),
-            transforms.Normalize(mean=[.5], std=[.5])])
+    # Set data download path
+    data_download_path = '/home/suyoung/Vscode/HAST/data'
+    if not os.path.exists(data_download_path):
+        os.makedirs(data_download_path)
+
+    data_transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.Grayscale(num_output_channels=3),  # Convert to grayscale but keep 3 channels
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[.5], std=[.5])])
      
-    train_dataset = DataClass(split='train', transform=data_transform, download=download, as_rgb=as_rgb, size=size)
-    val_dataset = DataClass(split='val', transform=data_transform, download=download, as_rgb=as_rgb, size=size)
-    test_dataset = DataClass(split='test', transform=data_transform, download=download, as_rgb=as_rgb, size=size)
+    train_dataset = DataClass(split='train', transform=data_transform, download=download, as_rgb=as_rgb, size=size, root=data_download_path)
+    val_dataset = DataClass(split='val', transform=data_transform, download=download, as_rgb=as_rgb, size=size, root=data_download_path)
+    test_dataset = DataClass(split='test', transform=data_transform, download=download, as_rgb=as_rgb, size=size, root=data_download_path)
 
     
     train_loader = data.DataLoader(dataset=train_dataset,
@@ -81,9 +82,10 @@ def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download
     
     
     if model_flag == 'resnet18':
-        model =  resnet18(pretrained=False, num_classes=n_classes) if resize else ResNet18(in_channels=n_channels, num_classes=n_classes)
+        # model =  resnet18(pretrained=False, num_classes=n_classes) if resize else ResNet18(in_channels=n_channels, num_classes=n_classes)
+        model =  resnet18(pretrained=False, num_classes=n_classes)
     elif model_flag == 'resnet50':
-        model =  resnet50(pretrained=False, num_classes=n_classes) if resize else ResNet50(in_channels=n_channels, num_classes=n_classes)
+        model =  resnet50(pretrained=False, num_classes=n_classes)
     else:
         raise NotImplementedError
 

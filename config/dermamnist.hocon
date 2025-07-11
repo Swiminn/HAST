@@ -1,19 +1,21 @@
 #  ------------ General options ----------------------------------------
 model_name = resnet18
-dataPath = "/home/suyoung/Vscode/HAST/data/dermamnist"
-dataset = "dermamnist_224" # options: imagenet | cifar100
+train_dataPath = "/home/suyoung/Vscode/HAST/data/imagenet"
+test_dataPath = "/home/suyoung/Vscode/HAST/data/dermamnist"
+train_dataset = "imagenet"  # training dataset
+test_dataset = "dermamnist_224"   # test dataset
 
 # ------------- Data options -------------------------------------------
 nThreads = 8  # number of data loader threads
 
 # ---------- Optimization options --------------------------------------
 nEpochs = 151  # number of total epochs to train 400
-batchSize = 16  # batchsize
+batchSize = 64  # batchsize
 momentum = 0.9  # momentum 0.9
 weightDecay = 1e-4  # weight decay 1e-4
 opt_type = "SGD"
 
-lr_S = 0.000001 # initial learning rate = 0.000001
+lr_S = 0.00001 # initial learning rate = 0.000001
 lrPolicy_S = "multi_step"  # options: multi_step | linear | exp | const | step
 step_S = [100,200,350]  # step for linear or exp learning rate policy default [200, 300, 400]
 decayRate_S = 0.1 # lr decay rate
@@ -22,12 +24,12 @@ decayRate_S = 0.1 # lr decay rate
 nClasses = 7  # number of classes in the dataset
 
 # ---------- Quantization options ---------------------------------------------
-qw = 2
-qa = 2
+qw = 3
+qa = 3
 
 # ----------KD options ---------------------------------------------
-temperature = 20
-alpha = 20
+temperature = 4
+alpha = 1
 
 # ----------Generator options ---------------------------------------------
 latent_dim = 100
